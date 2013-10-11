@@ -1,50 +1,558 @@
-#!/bin/bash
+#!/bin/sh 
 #
-# /etc/init.d/startvms
+# Virtual Machine throttle daemon for KVM/virsh 
+# 
 #
-# Script to start virtual machines at boot in specific order
-# Supports delays between starting VM’s
-
-DEFLAY=5
-PROG=/usr/bin/virsh
-VMDefFile=/etc/default/startvms
-test -x $PROG || exit 0
 
 . /lib/lsb/init-functions
-
-if [ ! -f $VMDefFile ]; then
-    log_daemon_msg “Starting Virtual Machines”
-    log_failure_msg “$VMDefFile doesnt exist, skipping auto-start”
-    log_end_msg 1
-    exit 2
+LAST_ATTEMPT=0
+BOLDFONT=`tput bold`
+NORMALFONT=`tput sgr0`
+LOGDIR="/var/log/libvirt/startvms"
+test -w "$LOGDIR" || LOGDIR="/tmp"
+#Full path to virsh exec makes calling safer
+VIRSHEXEC="/usr/bin/virsh"
+test -x $VIRSHEXEC || exit 0
+if [ `id -u` -eq 0 ]; then
+SUFORPERMS="sudo -u libvirt-qemu -g libvirtd"
+else
+SUFORPERMS=""
 fi
-echo ” * Starting Virtual Machines”
-for machine in `cat $VMDefFile`; do
-    VMName=`echo $machine | awk -F “:” ‘{print $1}’`
-    Delay=`echo $machine | awk -F “:” ‘{print $2}’`
-    log_daemon_msg “Starting $VMName”
-    PID=`ps ax | grep $VMName | grep -v grep | awk -F ” ” ‘{print $1}’`
-    if [ ! -z $PID ]; then
-        log_failure_msg “$VMName is already running”
-        log_end_msg 1
-    elif [ ! -f /etc/libvirt/qemu/$VMName.xml ]; then
-        log_failure_msg “$VMName is not defined”
-        log_end_msg 1
-    else
-        $PROG start $VMName >/dev/null 2>&1
-        if [ $? -eq 0 ]; then
-            if [ ! -z $Delay ]; then
-                log_progress_msg “Waiting $Delay seconds before starting next VM”
-                log_end_msg 0
-                sleep $Delay
-            else
-                log_end_msg 0
-            fi
-        else
-            log_failure_msg “$VMName has failed to start”
-            log_end_msg 1
-        fi
-    fi
-done
-log_end_msg 0
 
+
+	assesslinefrompipe()
+	{
+	VALIDCOMMANDS="stop restart boot shutdown"
+	VALIDCHANGE="VMLISTFILE RUNDIR KILLWAIT VERBOSE QUIET"
+	LINEFROMPIPE="$@"
+	IFS=":"
+	test -z $ASSESSTRING || unset ASSESSTRING
+	for CHECKLINE in $LINEFROMPIPE
+	do
+		if echo "$CHECKLINE" | grep -q "="; then
+			SET=`echo "$CHECKLINE" | cut -f1 -d '=' | tr '[:lower:]' '[:upper:]'`
+			AS=`echo "$CHECKLINE" | cut -f2 -d '='`
+			IFS=" "
+			for CHECKVARIABLE in $VALIDCHANGE
+			do
+				if [ "$CHECKVARIABLE" = "$SET" ]; then
+				unset $SET
+				if [ "$SET" = "RUNDIR" ]; then
+				test -z "$VERBOSE" || log_warning_msg "Rundir is changing to: $AS"
+				cleanUp
+				eval "$SET=$AS"
+				checkvars
+				cleanUp
+				pipeforge
+				test -z "$VERBOSE" || log_warning_msg "Using Pipe file: $PIPEFILE"
+				else
+				test "$AS" = "0" && unset $SET || eval "$SET=$AS"
+				test -z "$VERBOSE" || log_warning_msg "Variable has been changed: $SET"
+				fi
+				log_msg "Variable has been changed: $SET"
+				fi
+			done
+		else
+			ASSESSTRING=$ASSESSTRING$CHECKLINE" "
+		fi
+	done
+	checkvars
+	ASSESSTRING=`echo "${ASSESSTRING}" | awk '{gsub(/^ +| +$/,"")} {print $0}'`
+	IFS=" "
+	for CHECKLINE in $ASSESSTRING
+	do
+		for CHECKCOMMAND in $VALIDCOMMANDS
+		do
+			test "$CHECKLINE" = "$CHECKCOMMAND" -a "$CHECKCOMMAND" != "stop" && runthrottleaction $CHECKLINE
+			test "$CHECKLINE" = "$CHECKCOMMAND" -a "$CHECKCOMMAND" = "stop" && DAEMONDIE=1
+		done
+	done
+	#echo "Command String: \"$ASSESSTRING\""
+	if [ -z $DAEMONDIE ]; then
+	pipeforge
+	daemonize
+	else
+	runthrottleaction "stop"
+	log_msg "Stop detected, now leaving daemon function..."
+	log_daemon_msg "Stop detected, now leaving daemon function..."
+	cleanUp
+	log_end_msg 0
+	fi
+	return 0
+	}
+
+	buildlist()
+	{	
+		unset VMLISTSTD; unset VMLISTREV; unset VMNUM; unset VMTOTAL;
+		if [ ! -f "$VMLISTFILE" ]; then
+			log_failure_msg "File \"$VMLISTFILE\" does not exist, unable to continue..."
+			test "$VMLISTFILE" = "${VMLISTFILE%/*}" && NOPATH="1"
+			test -z $NOPATH || log_failure_msg "Please provide full path with filename..."
+			return 1
+		else
+			VMLISTSTD=`cat "$VMLISTFILE" | egrep -v '(^#|^\s*$|^\s*\t*#)'`
+			VMLISTREV=`tac "$VMLISTFILE" | egrep -v '(^#|^\s*$|^\s*\t*#)'`
+			VMTOTAL=`echo "$VMLISTSTD" | wc -l`
+			VMNUM="$VMTOTAL"
+		fi
+	return 0
+	}
+
+	checkvars()
+	{
+	params="$(getopt -o bhc:dil:r:aseqvw: -l background,help,command:,daemonize,initalize,list:,rundir:,start,status,stop,quiet,verbose,wait: --name "$0" -- "$@")"
+	eval set -- "$params"
+	
+	while true
+	do
+		case "$1" in
+		-h|--help)
+			SHOWHELP=1
+			shift
+		;;
+		-a|--start)
+			ALONESTART=1
+			shift
+		;;
+		-e|--stop)
+			ALONESTOP=1
+			shift
+		;;
+	        -c|--command)
+			case $2 in
+			-*)
+			log_msg "Invalid format detected in option \"$1\", or no command given."
+			usage "Invalid format detected in option \"$1\", or no command given."
+			exit 1
+			;;
+			esac
+			SENDTOPIPE=$2
+			shift 2
+		;;
+		-b|--background)
+			ACTION=0
+			shift
+		;;
+	        -d|--daemonize)
+			ACTION=1
+			shift
+		;;
+	        -i|--initalize)
+			ACTION=2
+			shift
+		;;
+	        -l|--list)
+			case $2 in
+			-*)
+			log_msg "Invalid format detected in option \"$1\", or no filename given."
+			usage "Invalid format detected in option \"$1\", or no filename given."
+			exit 1
+			;;
+			esac
+			VMLISTFILE=$2
+			shift 2
+		;;
+	        -r|--rundir)
+			case $2 in
+			-*)
+			log_msg "Invalid format detected in option \"$1\", or no directory given."
+			usage "Invalid format detected in option \"$1\", or no directory given."
+			exit 1
+			;;
+			esac
+			RUNDIR=$2
+			shift 2
+		;;
+	        -s|--status)
+			PRINTSTATUS=1
+			shift
+		;;
+	        -v|--verbose)
+			VERBOSE=1
+			shift
+		;;
+	        -q|--quiet)
+			QUIET=1
+			shift
+		;;
+	        --)
+			shift
+			break
+		;;
+		*)
+			printf "%s %s\n" "Function not yet implemented:" $1
+			exit 1
+		;;
+		esac
+	done
+	test "$RUNDIR" = "DEFAULT" -o "$RUNDIR" = "default" && unset RUNDIR
+	test "$RUNDIR" = "TMP" -o "$RUNDIR" = "tmp" && RUNDIR="/tmp/$(basename $0)"
+	test "$RUNDIR" = "TMP" -o "$RUNDIR" = "tmp" && mkdir -p "/tmp/$(basename $0)"	
+	
+	test -z "$RUNDIR" && RUNDIR="/var/run/libvirt/startvms"
+	test -z "$KILLWAIT" && KILLWAIT=300
+	test -z "$VMLISTFILE" && VMLISTFILE="/etc/default/startvms"
+	#If that doesn't exist, lets check if we are running in user controled mode and they have a list
+	test ! -r "$VMLISTFILE" -a -r "/home/$USER/startvms.list" && VMLISTFILE="/home/$USER/startvms.list"
+	test ! -w "$RUNDIR" -a -z "$VERBOSE" && log_warning_msg "Unable to write into \"$RUNDIR\" so I'm switching to \"/tmp/$(basename $0)\""
+	mkdir -p "/tmp/$(basename $0)"
+	test -w "$RUNDIR" || RUNDIR="/tmp/$(basename $0)"
+	PIPEFILE="$RUNDIR/startvms.pipe"
+	PIDFILE="$RUNDIR/startvms.pid"
+	return 1
+	}
+
+	cleanUp()
+	{
+		test -p "$PIPEFILE" && rm -f "$PIPEFILE"
+		test -f "$PIDFILE" && rm -f "$PIDFILE"
+		trap - INT TERM EXIT
+	}
+
+	daemonize()
+	{
+	DAEMONMODE=1
+	log_msg "Entering daemon function with pipe: $PIPEFILE"
+	echo $$ > $PIDFILE
+	while true; do
+		if read LINEFROMPIPE <$PIPEFILE; then
+			#LOOP de LOOP, we don't do anything here anymore... we break out and re-forge. Allows smooth variable change.
+			chmod 000 $PIPEFILE
+			break
+		else
+		break
+		fi
+
+	done
+	unset DAEMONMODE
+	assesslinefrompipe "$LINEFROMPIPE"
+	}
+
+	pipeforge()
+	{
+		trap "cleanUp; exit" INT TERM EXIT
+		test ! -p $PIPEFILE && `$SUFORPERMS mkfifo --mode=664 $PIPEFILE` || `chmod "0664" $PIPEFILE`
+	}
+
+	run_virsh()
+	{
+		# We parse the output for things like domain state;
+		# make sure the output is in the language we expect.
+		LANG=C $SUFORPERMS $VIRSHEXEC "$@"
+	}
+
+	getstate()
+	{
+		run_virsh domstate "$1" | sed 's/\ //g' | egrep -v '(^#|^\s*$|^\s*\t*#)'
+	}
+
+	log_msg()
+	{
+		test -z $USER && USER="daemon"
+		test -z $VMNAME && LOGTAG="VMStarter" || LOGTAG="VMStarter: $VMNAME"
+		logger -p daemon.debug -s -t "$LOGTAG" -- "$@" >> "$LOGDIR/startvms.$USER.log" 2>&1
+	}
+
+	runthrottleaction()
+	{
+	buildlist
+	test "$?" -eq "1" && return 1
+
+	case $@ in
+	status)
+		log_msg "Status called... hrmz"
+		echo
+		echo "Not yet implemented."
+		echo
+		exit 1
+	;;
+	restart)
+		runthrottleaction "shutdown"
+		runthrottleaction "boot"
+	;;
+	boot)
+		log_msg "Begining startup of Virtual Machines..."
+		test ! -z "$VERBOSE" -a -z "$QUIET" && log_warning_msg "Begining startup of Virtual Machines."
+		for machine in $VMLISTSTD; do
+			VMNUM=$(($VMNUM - 1))
+			VMNAME=`echo $machine | cut -f1 -d ':'`
+			bootcooldown=`echo $machine | cut -f2 -d ':'`
+			pauseforboot=`echo $machine | cut -f3 -d ':'`
+			if [ -z $bootcooldown ]; then
+				bootcooldown=0
+			fi
+			if [ -z $pauseforboot ]; then
+				pauseforboot=0
+			fi
+
+			if [ "`getstate $VMNAME`" != "running" ]; then
+				if [ "$pauseforboot" -ge "1" ]; then
+					log_msg "Waiting $pauseforboot seconds before starting Virtual Machine"
+					log_daemon_msg "Waiting $pauseforboot seconds before starting Virtual Machine: $VMNAME"
+					sleep $pauseforboot
+					log_end_msg 0
+				fi
+				log_msg "Booting Virtual Machine: $VMNAME"
+				log_daemon_msg "Booting Virtual Machine: $VMNAME"
+				DEADLINE=$(( `date +"%s"` + 10))
+				C2=0
+
+				while true; do
+					case `getstate $VMNAME` in
+					running)
+						if [ "$C2" -ge "1" ]; then 
+							log_msg "Startup sucessfully!" 
+						else 
+							log_msg "Was never down... kinda curious?" 
+						fi
+							log_end_msg 0
+							break;
+					;;
+					shutoff)
+					if [ $(( `date +"%s"` - $LAST_ATTEMPT  )) -ge "2" ]; then
+						if [ "$C2" -eq "0" ]; then
+							log_msg "First Startup attempt"
+							run_virsh start $VMNAME >/dev/null 2>&1
+							LAST_ATTEMPT="`date +"%s"`"
+						else
+							log_msg "Retry Startup attempt"
+							run_virsh start $VMNAME >/dev/null 2>&1
+							LAST_ATTEMPT="`date +"%s"`"
+						fi
+							C2=$(($C2 + 1))
+					fi
+					esac
+			
+					if [ "`date +"%s"`" -ge "$DEADLINE" ]; then
+						log_end_msg 1
+						log_msg "start failed... Force destroying Virtual Machine!"
+						log_failure_msg "Startup failed... Force destroying $VMNAME!"
+						run_virsh destroy $VMNAME >/dev/null 2>&1
+					break;
+					fi
+
+				done 
+				if [ "$bootcooldown" -ge "1" ] && [ "$VMNUM" -ge "1" ] && [ "$C2" -ge "1" ]; then
+					log_msg "Waiting $bootcooldown seconds before starting next Virtual Machine"
+					log_daemon_msg "Waiting $bootcooldown seconds before starting next Virtual Machine"
+					sleep $bootcooldown
+					log_end_msg 0
+				fi
+	
+			else
+				log_msg "Already running, so skipping it."
+				log_warning_msg "Virtual Machine \"$VMNAME\" is already running..."
+			fi
+		done
+	;;
+	shutdown)
+		log_msg "Begining shutdown of Virtual Machines..."
+		test ! -z "$VERBOSE" -a -z "$QUIET" && log_warning_msg "Begining shutdown of Virtual Machines."
+		for machine in $VMLISTREV; do
+			VMNAME=`echo $machine | cut -f1 -d ':'`
+			if [ "`getstate $VMNAME`" = "running" ]; then
+				log_msg "Shutting down Virtual Machine."
+				log_daemon_msg "Shutdown Virtual Machine: $VMNAME"
+				DEADLINE=$(( `date +"%s"` + $KILLWAIT))
+				C2=0
+				while true; do
+					case `getstate $VMNAME` in
+					shutoff)
+						if [ "$C2" -ge "1" ]; then 
+							log_msg "Shutdown sucessfully!" 
+						else 
+							log_msg "Was never running... Did I do anything besides spam the log?" 
+						fi
+						log_end_msg 0
+						break;
+					;;
+					running)
+						if [ $(( `date +"%s"` - $LAST_ATTEMPT  )) -ge "5" ]; then
+							if [ "$C2" -eq "0" ]; then
+								log_msg "First Shutdown attempt"
+								run_virsh shutdown $VMNAME >/dev/null 2>&1
+								LAST_ATTEMPT="`date +"%s"`"
+							else
+								log_msg "Retry Shutdown attempt"
+								run_virsh shutdown $VMNAME >/dev/null 2>&1
+								LAST_ATTEMPT="`date +"%s"`"
+							fi
+							C2=$(($C2 + 1))
+						fi
+					esac
+				
+					if [ "`date +"%s"`" -ge "$DEADLINE" ]; then
+						log_end_msg 1
+						log_msg "Shutdown failed... Force destroying Virtual Machine!"
+						log_failure_msg "Shutdown failed... Force destroying $VMNAME!"
+						run_virsh destroy $VMNAME >/dev/null 2>&1
+						break;
+					fi
+				done 
+			else
+				log_msg "Not running, lets skip"
+				log_warning_msg "Virtual Machine \"$VMNAME\" is not running..."
+			fi
+		done
+	;;
+	stop)
+		log_msg "Begining stop iniative..."
+		test ! -z "$VERBOSE" -a -z "$QUIET" && log_warning_msg "Begining stop iniative..."
+		VIRSHRUNNING=`run_virsh list | awk '$3 == "running" {print $2}'`
+		for VMNAME in $VIRSHRUNNING; do
+			log_msg "Shutting down Virtual Machine."
+			log_daemon_msg "Shutdown Virtual Machine: $VMNAME"
+			DEADLINE=$(( `date +"%s"` + $KILLWAIT))
+			C2=0
+			while true; do
+				case `getstate $VMNAME` in
+				shutoff)
+					if [ "$C2" -ge "1" ]; then 
+						log_msg "Shutdown sucessfully!" 
+					else 
+						log_msg "Was never running... Did I do anything besides spam the log?" 
+					fi
+					log_end_msg 0
+					break;
+				;;
+				running)
+					if [ $(( `date +"%s"` - $LAST_ATTEMPT  )) -ge "5" ]; then
+						if [ "$C2" -eq "0" ]; then
+							log_msg "First Shutdown attempt"
+							run_virsh shutdown $VMNAME >/dev/null 2>&1
+							LAST_ATTEMPT="`date +"%s"`"
+						else
+							log_msg "Retry Shutdown attempt"
+							run_virsh shutdown $VMNAME >/dev/null 2>&1
+							LAST_ATTEMPT="`date +"%s"`"
+						fi
+						C2=$(($C2 + 1))
+					fi
+				esac
+				if [ "`date +"%s"`" -ge "$DEADLINE" ]; then
+					log_end_msg 1
+					log_msg "Shutdown failed... Force destroying Virtual Machine!"
+					log_failure_msg "Shutdown failed... Force destroying $VMNAME!"
+					run_virsh destroy $VMNAME >/dev/null 2>&1
+					break;
+				fi
+			done 
+		done
+	;;
+	*)
+	echo "\"$1\""
+	esac
+	DONESOMETHING=1	
+	}
+
+	usage() 
+	{
+	clear
+	if [ ! -z "$@" ]; then
+	printf "%s\n%s\n" "The following error was detected:" "${BOLDFONT}$@${NORMALFONT}"
+	printf "\n"
+	fi
+	printf "%s\n" "Usage:"
+	printf "%s\n" " Daemon -"
+	printf "%s\n" "  $(basename $0) {-h} {-v|q} {-b|d|i} {-c start|stop|boot|shutdown|restart|status}"
+	printf "%s\n" " Standalone -"
+	printf "%s\n" "  $(basename $0) {-h} {-a|e|s} {-v|q}"
+	printf "\n"
+	printf "%s\n" "OPTIONS:"
+	printf "%s\t\t\t%s\n" "   -h|--help" "Show this message then exit."
+	printf "%s\t\t\t%s\n" "   -a|--start" "Start VMs in standalone mode."
+	printf "%s\t\t\t%s\n" "   -e|--stop" "Stop VMs from list in standalone mode."
+	printf "%s\t\t\t%s\n" "   -s|--status" "Show the status of daemon."
+	printf "%s\t%s\n" "   -c|--command \"command\"" "Send command to daemon, such as start/stop."
+	printf "%s\t\t%s\n" "   -b|--background" "Forge Background throttle daemon with pipe."
+	printf "%s\t\t%s\n" "   -d|--daemonize" "Meant for service startup, will lock the shell."
+	printf "%s\t\t%s\n" "   -i|--initalize" "Same as --daemonize but loads all VM's on start."
+	printf "%s\t\t%s\n" "   -l|--list \"listfile\"" "Specify the file name to load VM's from"
+	printf "%s\t\t%s\n" "   -p|--pipe \"pipefile\"" "Specify the file name to be used for piping"
+	printf "%s\t\t\t%s\n" "   -v|--verbose" "Enable verbose output, giving more debug info."
+	printf "%s\t\t\t%s\n" "   -q|--quiet" "Mute all output and just run sent commands."
+	printf "\n"
+	test -z "$VERBOSE" || printf "%s\n" "Re-Authored:"
+	test -z "$VERBOSE" || printf "%s\n\n" "Stephen Knill - stephen.knill@live.com.au"
+	test -z "$VERBOSE" || printf "%s\n" "Original By:"
+	test -z "$VERBOSE" || printf "%s\n%s\n\n" "Ryan Davies - ryan@professional.geek.nz" "I rebuilt his little script, thanks mate!"
+	}
+
+checkvars $@
+
+buildlist
+
+if [ ! -z $QUIET ] && [ ! -z $VERBOSE ]; then
+	log_warning_msg "You can't use both \"--verbose\" and \"--quiet\" at the same time!" 1>&2
+	log_warning_msg "Option \"--quiet\" will now be ignored, \"--verbose\" is active." 1>&2  
+	unset QUIET
+fi
+
+if [ ! -z "$SHOWHELP" ]; then
+	unset ACTION; unset ALONESTART; unset ALONESTOP; unset SENDTOPIPE; unset PRINTSTATUS;
+	usage
+	DONESOMETHING=1
+fi
+
+if [ ! -z "$ALONESTART" ]; then
+	unset ACTION; unset SENDTOPIPE; unset PRINTSTATUS;
+	runthrottleaction "boot"
+	DONESOMETHING=1
+fi
+
+if [ ! -z "$ALONESTOP" ]; then
+	unset ACTION; unset SENDTOPIPE; unset PRINTSTATUS;
+	runthrottleaction "shutdown"
+	DONESOMETHING=1
+fi
+
+if [ ! -z $ACTION ]; then
+	test $ACTION -gt "0" -a -z "$QUIET" && log_daemon_msg "Initating Virtual Machine Throttle daemon"
+	if [ -p $PIPEFILE ]; then
+		test $ACTION -gt "0" -a -z "$QUIET" && log_end_msg 1
+		test -z "$VERBOSE" -o ! -z "$QUIET" || log_failure_msg "Pipe file already active... can't start another instance." 1>&2 
+		exit 1
+	fi
+	test "$ACTION" -eq "0" && exec $0 --daemonize --verbose &
+	test $ACTION -gt "0" -a -z "$QUIET" && log_end_msg 0
+	if [ "$ACTION" -ge "1" ]; then
+		pipeforge
+		test "$ACTION" -eq "2" && runthrottleaction "boot"
+		daemonize
+	fi
+	DONESOMETHING=1
+fi
+
+if [ ! -z "$SENDTOPIPE" ]; then
+	if [ -p "$PIPEFILE" ]; then
+		if [ ! -w "$PIPEFILE" ]; then
+			log_failure_msg "${BOLDFONT}Can not send to pipe, critical failure... this should never happen!${NORMALFONT}" 1>&2
+			exit 1
+		fi
+		test -z "$VERBOSE" -o ! -z "$QUIET" || log_daemon_msg "Pass command \"$SENDTOPIPE\" to Virtual Machine Throttle Daemon"
+		timeout 10 sh -c "echo $SENDTOPIPE > $PIPEFILE"
+		#test -z $result && printf "%s\n" "empty" || printf "%s\n" "got stuff"
+		test -z "$VERBOSE" -o ! -z "$QUIET" || log_end_msg 0
+	else
+	
+		log_failure_msg "Virtual Machine Throttle daemon is not running"
+		test -z "$VERBOSE" || log_failure_msg "You can start it with the following command: \"$0 --background\"" 1>&2	
+	fi
+	exit 0
+fi
+
+if [ ! -z "$PRINTSTATUS" ]; then  
+	if [ ! -p "$PIPEFILE" ]; then
+		log_failure_msg "Virtual Machine Throttle daemon is not running"
+	else
+		log_daemon_msg "Virtual Machine Throttle daemon is active"
+		log_end_msg 0
+	fi
+	DONESOMETHING=1
+fi
+
+
+test -z "$DONESOMETHING" && usage "No command input given, did you want to do something?"
+
+## -- END OF FILE -- DO NOT DELETE OR EDIT PAST -- END OF FILE -- ##
+exit 0

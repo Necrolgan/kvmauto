@@ -1,4 +1,23 @@
-DNS_Server:10
-MythBackend:5
-TestServer
+##########################################################
+#     Virtual Machines to load are defined in here.      #
+#  Format usage VM_NAME:DELAYAFTERBOOT:DELAYBEFOREBOOT   #
+#   All Delays are optional - List order is boot order   #
+#     Only lines that are not hashed out are valid.      #
+# Delay After Boot will be ignored on last/only VM boot  #
+# Excessive delay usage is not sugested, keep it simple  #
+##########################################################
 
+#WinXP:10:5
+#em_linux
+#Win7:0:1
+
+
+#For server setup.
+#ADDS_vm:30:15
+#FileShare_vm:30:0
+#MediaShare_vm:90:0
+#mysql_vm:5:0
+#apache_vm:0:10
+
+
+#None, all hashed out
