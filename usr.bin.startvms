@@ -1,0 +1,50 @@
+#!/bin/bash
+#
+# /etc/init.d/startvms
+#
+# Script to start virtual machines at boot in specific order
+# Supports delays between starting VM’s
+
+DEFLAY=5
+PROG=/usr/bin/virsh
+VMDefFile=/etc/default/startvms
+test -x $PROG || exit 0
+
+. /lib/lsb/init-functions
+
+if [ ! -f $VMDefFile ]; then
+    log_daemon_msg “Starting Virtual Machines”
+    log_failure_msg “$VMDefFile doesnt exist, skipping auto-start”
+    log_end_msg 1
+    exit 2
+fi
+echo ” * Starting Virtual Machines”
+for machine in `cat $VMDefFile`; do
+    VMName=`echo $machine | awk -F “:” ‘{print $1}’`
+    Delay=`echo $machine | awk -F “:” ‘{print $2}’`
+    log_daemon_msg “Starting $VMName”
+    PID=`ps ax | grep $VMName | grep -v grep | awk -F ” ” ‘{print $1}’`
+    if [ ! -z $PID ]; then
+        log_failure_msg “$VMName is already running”
+        log_end_msg 1
+    elif [ ! -f /etc/libvirt/qemu/$VMName.xml ]; then
+        log_failure_msg “$VMName is not defined”
+        log_end_msg 1
+    else
+        $PROG start $VMName >/dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            if [ ! -z $Delay ]; then
+                log_progress_msg “Waiting $Delay seconds before starting next VM”
+                log_end_msg 0
+                sleep $Delay
+            else
+                log_end_msg 0
+            fi
+        else
+            log_failure_msg “$VMName has failed to start”
+            log_end_msg 1
+        fi
+    fi
+done
+log_end_msg 0
+
